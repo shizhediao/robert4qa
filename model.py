@@ -18,7 +18,7 @@ class TweetModel(transformers.BertPreTrainedModel):
         self.lstm = nn.LSTM(input_size = 768 * 6, hidden_size = 768, num_layers = 1, bidirectional = True, batch_first = True)
 
         # 两维（情感文本首词概率，情感文本末词概率）
-        self.l0 = nn.Linear(768 * 6, 2)
+        self.l0 = nn.Linear(768 * 2, 2)
 
     def forward(self, input_ids, mask, token_type):
         # bert层数 x batch_size x 序列长度(160) x 768

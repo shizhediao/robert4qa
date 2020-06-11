@@ -14,6 +14,21 @@ import utils
 from dataset import TweetDataset
 from model import TweetModel
 
+from torch.utils.data.distributed import DistributedSampler
+
+distributed = True
+
+
+if distributed:
+    # 1) 初始化
+    torch.distributed.init_process_group(backend="nccl")
+
+    # 2） 配置每个进程的gpu
+    local_rank = torch.distributed.get_rank()
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+
 
 def cal_loss(start_logits, end_logits, start_positions, end_positions):
     loss_fn = nn.CrossEntropyLoss()
@@ -115,18 +130,17 @@ def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, val
     df_train = dfx[dfx.kfold != fold].reset_index(drop = True)
     df_valid = dfx[dfx.kfold == fold].reset_index(drop = True)
 
-    # 训练集
+    train_sampler = None
+    val_sampler = None
+
+
+    # 训练集  # 3）使用DistributedSampler
     train_dataset = TweetDataset(
         tweet = df_train.text.values,
         sentiment = df_train.sentiment.values,
         selected_text = df_train.selected_text.values,
         tokenizer = tokenizer,
         max_len = max_len
-    )
-    train_data_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size = train_batch_size,
-        num_workers = 4
     )
     # 验证集
     valid_dataset = TweetDataset(
@@ -136,10 +150,25 @@ def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, val
         tokenizer = tokenizer,
         max_len = max_len
     )
+
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset)
+
+    train_data_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size = train_batch_size,
+        shuffle=(train_sampler is None),
+        num_workers = 4,
+        sampler=train_sampler
+    )
+
     valid_data_loader = torch.utils.data.DataLoader(
         valid_dataset,
         batch_size = valid_batch_size,
-        num_workers = 2
+        shuffle=False,
+        num_workers = 2,
+        sampler=val_sampler
     )
 
     device = torch.device("cuda")
@@ -148,6 +177,15 @@ def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, val
     model_config.output_hidden_states = True
     model = TweetModel(roberta_path = roberta_path, conf = model_config)
     model.to(device)
+
+    if torch.cuda.device_count() > 1:
+        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        # 5) 封装
+        model = torch.nn.parallel.DistributedDataParallel(model,
+                                                          device_ids=[local_rank],
+                                                          output_device=local_rank,
+                                                          find_unused_parameters=True)
+
 
     num_train_steps = int(len(df_train) / train_batch_size * epochs)
     param_optimizer = list(model.named_parameters())
@@ -168,6 +206,8 @@ def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, val
     print("Training is Starting for fold", fold)
 
     for epoch in range(epochs):
+        if distributed:
+            train_sampler.set_epoch(epoch)
         train_fn(train_data_loader, model, optimizer, device, scheduler = scheduler)
         jaccard = eval_fn(valid_data_loader, model, device)
         print("Jaccard Score = ", jaccard)
