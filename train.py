@@ -16,19 +16,6 @@ from model import TweetModel
 
 from torch.utils.data.distributed import DistributedSampler
 
-distributed = True
-
-
-if distributed:
-    # 1) 初始化
-    torch.distributed.init_process_group(backend="nccl")
-
-    # 2） 配置每个进程的gpu
-    local_rank = torch.distributed.get_rank()
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-
-
 
 def cal_loss(start_logits, end_logits, start_positions, end_positions):
     loss_fn = nn.CrossEntropyLoss()
@@ -216,11 +203,41 @@ def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, val
             print("Early stopping")
             break
 
+distributed = True
 
-max_len = 160
-train_batch_size = 16
-valid_batch_size = 8
-epochs = 3
+
+if distributed:
+    # 1) 初始化
+    torch.distributed.init_process_group(backend="nccl")
+
+    # 2） 配置每个进程的gpu
+    local_rank = torch.distributed.get_rank()
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+import argparse
+
+parser = argparse.ArgumentParser(description='robert4qa')
+parser.add_argument('--max_len', type=int, default=160,
+                    help='maximum length')
+parser.add_argument('--train_batch_size', type=int, default=16,
+                    help='maximum length')
+parser.add_argument('--valid_batch_size', type=int, default=8,
+                    help='maximum length')
+parser.add_argument('--epochs', type=int, default=5,
+                    help='maximum length')
+
+
+args = parser.parse_args()
+print(vars(args))
+max_len = args.max_len
+train_batch_size = args.train_batch_size
+valid_batch_size = args.valid_batch_size
+epochs = args.epochs
+# max_len = 160
+# train_batch_size = 16
+# valid_batch_size = 8
+# epochs = 3
 
 roberta_path = "./roberta-base"
 training_file = "./train-kfolds/train_5folds.csv"
