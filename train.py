@@ -13,7 +13,7 @@ from tqdm.autonotebook import tqdm
 import utils
 from dataset import TweetDataset
 from model import TweetModel
-
+import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -108,10 +108,10 @@ def eval_fn(data_loader, model, device):
             jaccards.update(np.mean(jaccard_scores), input_ids.size(0))
             losses.update(loss.item(), input_ids.size(0))
             tk.set_postfix(loss=losses.avg, jaccard=jaccards.avg)
-    print("Jaccard = ", jaccards.avg)
+    # print("Jaccard = ", jaccards.avg)
     return jaccards.avg
 
-def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path):
+def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path, lr, patience, num_warmup_steps):
     dfx = pd.read_csv(training_file)
 
     df_train = dfx[dfx.kfold != fold].reset_index(drop = True)
@@ -166,7 +166,8 @@ def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, val
     model.to(device)
 
     if torch.cuda.device_count() > 1:
-        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        num_device = torch.cuda.device_count()
+        print("Let's use", num_device, "GPUs!")
         # 5) 封装
         model = torch.nn.parallel.DistributedDataParallel(model,
                                                           device_ids=[local_rank],
@@ -182,14 +183,14 @@ def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, val
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
     ]
 
-    optimizer = AdamW(optimizer_parameters, lr = 3e-5)
+    optimizer = AdamW(optimizer_parameters, lr = lr * num_device)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps = 200,
+        num_warmup_steps = num_warmup_steps,
         num_training_steps = num_train_steps
     )
 
-    es = utils.EarlyStopping(patience = 2, mode = "max")
+    es = utils.EarlyStopping(patience = patience, mode = "max")
     print("Training is Starting for fold", fold)
 
     for epoch in range(epochs):
@@ -197,11 +198,29 @@ def train(fold, epochs, training_file, tokenizer, max_len, train_batch_size, val
             train_sampler.set_epoch(epoch)
         train_fn(train_data_loader, model, optimizer, device, scheduler = scheduler)
         jaccard = eval_fn(valid_data_loader, model, device)
-        print("Jaccard Score = ", jaccard)
-        es(jaccard, model, model_path = f"./bin/model_{fold}.bin")
-        if es.early_stop:
-            print("Early stopping")
-            break
+
+        # if distributed:
+        #     jaccard_reduce = reduce_tensor(jaccard)
+        # print("jaccard_reduce:", jaccard_reduce)
+        if not distributed or (distributed and torch.distributed.get_rank() == 0):
+            print("Jaccard Score = ", jaccard)
+            es(jaccard, model, model_path = f"./bin/model_{fold}.bin")
+            if es.early_stop:
+                print("Early stopping")
+                break
+
+    del model, optimizer, scheduler, df_train, df_valid, train_dataset, valid_dataset, train_data_loader, valid_data_loader
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def reduce_tensor(tensor):
+    args.world_size = torch.distributed.get_world_size()
+    # rt = tensor.clone()
+    rt = tensor
+    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    rt /= args.world_size
+    return rt
 
 distributed = True
 
@@ -221,11 +240,20 @@ parser = argparse.ArgumentParser(description='robert4qa')
 parser.add_argument('--max_len', type=int, default=160,
                     help='maximum length')
 parser.add_argument('--train_batch_size', type=int, default=16,
-                    help='maximum length')
+                    help='train_batch_size')
 parser.add_argument('--valid_batch_size', type=int, default=8,
-                    help='maximum length')
+                    help='valid_batch_size')
 parser.add_argument('--epochs', type=int, default=5,
-                    help='maximum length')
+                    help='epochs')
+parser.add_argument("--local_rank", default=0, type=int)
+
+parser.add_argument('--lr', type=float, default=3e-5,
+                    help='lr')
+
+parser.add_argument('--patience', type=int, default=3,
+                    help='patience')
+parser.add_argument('--num_warmup_steps', type=int, default=200,
+                    help='num_warmup_steps')
 
 
 args = parser.parse_args()
@@ -249,8 +277,13 @@ tokenizer = tokenizers.ByteLevelBPETokenizer(
     add_prefix_space = True
 )
 
-train(0, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
-train(1, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
-train(2, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
-train(3, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
-train(4, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
+# train(0, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
+# train(1, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
+# train(2, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
+# train(3, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
+# train(4, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path)
+train(0, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path, args.lr, args.patience, args.num_warmup_steps)
+train(1, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path, args.lr, args.patience, args.num_warmup_steps)
+train(2, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path, args.lr, args.patience, args.num_warmup_steps)
+train(3, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path, args.lr, args.patience, args.num_warmup_steps)
+train(4, epochs, training_file, tokenizer, max_len, train_batch_size, valid_batch_size, roberta_path, args.lr, args.patience, args.num_warmup_steps)
